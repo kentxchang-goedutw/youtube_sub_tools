@@ -1,0 +1,6 @@
+customtkinter
+yt-dlp
+faster-whisper
+ctranslate2
+av
+onnxruntime

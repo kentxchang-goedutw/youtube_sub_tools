@@ -783,8 +783,8 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.meta_var = tk.StringVar(value="")
 
         self.title("YouTube 字幕辨識生成工具")
-        self.geometry("980x620")
-        self.minsize(840, 600)
+        self.geometry("980x760")
+        self.minsize(840, 700)
         self.configure(fg_color="#f6f3f8")
         self.transient(master)
 
@@ -796,7 +796,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.grid_rowconfigure(1, weight=1)
 
         hero = ctk.CTkFrame(self, fg_color="#ffffff", corner_radius=20)
-        hero.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="ew")
+        hero.grid(row=0, column=0, padx=14, pady=(12, 8), sticky="ew")
         hero.grid_columnconfigure(1, weight=1)
 
         logo = ctk.CTkFrame(hero, width=44, height=44, fg_color="#287fec", corner_radius=14)
@@ -831,10 +831,10 @@ class RecognitionWindow(ctk.CTkToplevel):
             justify="left",
             padx=12,
             pady=8,
-        ).grid(row=2, column=0, columnspan=2, padx=18, pady=(0, 12), sticky="ew")
+        ).grid(row=2, column=0, columnspan=2, padx=18, pady=(0, 10), sticky="ew")
 
         content = ctk.CTkFrame(self, fg_color="transparent")
-        content.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="nsew")
+        content.grid(row=1, column=0, padx=14, pady=(0, 12), sticky="nsew")
         content.grid_columnconfigure(0, weight=40)
         content.grid_columnconfigure(1, weight=60)
         content.grid_rowconfigure(0, weight=1)
@@ -851,7 +851,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         parent.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(parent, text="媒體來源", text_color="#30283f", font=ctk.CTkFont(size=16, weight="bold")).grid(
-            row=0, column=0, padx=18, pady=(16, 8), sticky="w"
+            row=0, column=0, padx=18, pady=(14, 6), sticky="w"
         )
 
         source_box = ctk.CTkFrame(parent, fg_color="#fbf9fd", border_width=1, border_color="#d9d0e5", corner_radius=16)
@@ -869,7 +869,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         )
 
         settings = ctk.CTkFrame(parent, fg_color="transparent")
-        settings.grid(row=2, column=0, padx=18, pady=(12, 0), sticky="ew")
+        settings.grid(row=2, column=0, padx=18, pady=(10, 0), sticky="ew")
         settings.grid_columnconfigure((0, 1), weight=1)
 
         self.add_option(settings, "模型", self.model_var, ["tiny", "base", "small", "medium", "large-v3"], 0, 0)
@@ -878,7 +878,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.add_option(settings, "精度", self.compute_var, ["float16", "int8_float16", "int8"], 1, 1)
 
         segment_box = ctk.CTkFrame(parent, fg_color="#fbf9fd", corner_radius=16)
-        segment_box.grid(row=3, column=0, padx=18, pady=(10, 0), sticky="ew")
+        segment_box.grid(row=3, column=0, padx=18, pady=(8, 0), sticky="ew")
         segment_box.grid_columnconfigure((0, 1, 2), weight=1)
         ctk.CTkLabel(segment_box, text="字幕切割粒度", text_color="#30283f", font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=0, column=0, columnspan=3, padx=14, pady=(10, 4), sticky="w"
@@ -889,7 +889,7 @@ class RecognitionWindow(ctk.CTkToplevel):
             )
 
         actions = ctk.CTkFrame(parent, fg_color="transparent")
-        actions.grid(row=4, column=0, padx=18, pady=(14, 8), sticky="ew")
+        actions.grid(row=4, column=0, padx=18, pady=(12, 6), sticky="ew")
         actions.grid_columnconfigure((0, 1), weight=1)
         self.check_button = ctk.CTkButton(actions, text="檢查環境", height=36, fg_color="#2dc9be", hover_color="#23aaa1", command=self.check_environment)
         self.check_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
@@ -904,7 +904,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.transcribe_button.grid(row=0, column=1, padx=(6, 0), sticky="ew")
 
         save_actions = ctk.CTkFrame(parent, fg_color="transparent")
-        save_actions.grid(row=5, column=0, padx=18, pady=(6, 18), sticky="ew")
+        save_actions.grid(row=5, column=0, padx=18, pady=(4, 14), sticky="ew")
         save_actions.grid_columnconfigure((0, 1), weight=1)
         self.save_button = ctk.CTkButton(save_actions, text="另存 SRT", height=34, command=self.save_as, state="disabled")
         self.save_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")

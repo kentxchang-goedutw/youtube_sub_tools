@@ -89,6 +89,19 @@ python3 youtube_subtitle_tool.py
 
 執行後會開啟桌面視窗。
 
+### 快速啟動（雙擊開啟）
+
+本專案也提供可直接雙擊啟動的腳本：
+
+- Windows：執行 `run_windows.bat`
+- macOS：執行 `run_mac.command`
+
+macOS 第一次使用前，需先在終端機為檔案加入可執行權限（在專案資料夾內執行）：
+
+```bash
+chmod +x run_mac.command
+```
+
 ## 五、基本使用流程
 
 ### 下載字幕

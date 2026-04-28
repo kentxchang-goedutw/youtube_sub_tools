@@ -58,6 +58,8 @@ APP_DIR = Path(__file__).resolve().parent
 WHISPER_OUTPUT_DIR = APP_DIR / "outputs"
 WHISPER_MEDIA_DIR = WHISPER_OUTPUT_DIR / "youtube_media"
 ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm", ".mkv", ".mov", ".aac", ".flac"}
+MEDIA_QUALITY_OPTIONS = ["最佳", "1080p", "720p", "480p", "360p", "240p", "144p"]
+MEDIA_FORMAT_OPTIONS = ["mp4", "mp3"]
 
 SEGMENT_RULES = {
     "fine": {"label": "細緻", "max_chars": 24, "max_duration": 4.2, "punctuation": "，。！？；,.!?;"},
@@ -435,6 +437,124 @@ class SubtitleService:
 
         raise ValueError("YouTube 音訊下載完成，但找不到輸出的媒體檔。")
 
+    def download_youtube_media(
+        self,
+        youtube_url: str,
+        output_dir: str,
+        media_format: str,
+        quality: str,
+        progress_callback: Optional[Callable[[str, Optional[float]], None]] = None,
+    ) -> str:
+        """
+        下載 YouTube 影片或音訊。
+
+        Args:
+            youtube_url: YouTube 影片網址。
+            output_dir: 輸出資料夾。
+            media_format: 目標格式，mp4 或 mp3。
+            quality: 影片畫質選項。
+            progress_callback: 進度訊息回呼。
+
+        Returns:
+            下載完成的檔案路徑。
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        target_format = media_format.strip().lower()
+        if target_format not in MEDIA_FORMAT_OPTIONS:
+            raise ValueError("下載格式只支援 mp4 或 mp3。")
+
+        def notify(message: str, progress: Optional[float] = None) -> None:
+            if progress_callback is not None:
+                progress_callback(message, progress)
+
+        def progress_hook(status: Dict[str, Any]) -> None:
+            if status.get("status") == "downloading":
+                downloaded = float(status.get("downloaded_bytes") or 0)
+                total = float(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
+                if total > 0:
+                    progress = max(0.0, min(downloaded / total, 1.0))
+                    notify(f"正在下載 {target_format.upper()}：{progress * 100:.1f}%", progress)
+                else:
+                    notify(f"正在下載 {target_format.upper()}……")
+            elif status.get("status") == "finished":
+                notify("下載完成，正在整理輸出檔案……", 1.0)
+
+        options: Dict[str, Any] = {
+            "outtmpl": str(output_path / "%(title).160B-%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "restrictfilenames": True,
+            "progress_hooks": [progress_hook],
+        }
+
+        if target_format == "mp3":
+            options.update(
+                {
+                    "format": "bestaudio/best",
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                }
+            )
+            notify("正在下載 YouTube 音訊並轉成 MP3。")
+        else:
+            height = parse_quality_height(quality)
+            ffmpeg_available = shutil.which("ffmpeg") is not None
+            if height is None and ffmpeg_available:
+                video_format = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best[ext=mp4]/best"
+            elif height is None:
+                video_format = "b[ext=mp4]/best[ext=mp4]/best"
+            elif ffmpeg_available:
+                video_format = (
+                    f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
+                    f"b[height<={height}][ext=mp4]/best[height<={height}][ext=mp4]/best"
+                )
+            else:
+                video_format = (
+                    f"b[height<={height}][ext=mp4]/"
+                    f"best[height<={height}][ext=mp4]/best[ext=mp4]/best"
+                )
+            options.update({"format": video_format, "merge_output_format": "mp4"})
+            notify(f"正在下載 YouTube 影片，畫質：{quality}。")
+
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                prepared = Path(ydl.prepare_filename(info))
+        except Exception as exc:
+            raise ValueError(f"YouTube 影片下載失敗：{exc}") from exc
+
+        video_id = str(info.get("id") or "")
+        candidates = sorted(output_path.glob(f"*{video_id}*.{target_format}"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if candidates:
+            return str(candidates[0])
+
+        requested = info.get("requested_downloads") or []
+        for item in requested:
+            for key in ("filepath", "filename"):
+                file_path = Path(str(item.get(key) or ""))
+                if file_path.exists():
+                    if target_format == "mp3" and file_path.suffix.lower() != ".mp3":
+                        mp3_path = file_path.with_suffix(".mp3")
+                        if mp3_path.exists():
+                            return str(mp3_path)
+                    return str(file_path)
+
+        target_path = prepared.with_suffix(f".{target_format}")
+        if target_path.exists():
+            return str(target_path)
+        if prepared.exists():
+            return str(prepared)
+
+        raise ValueError("下載完成，但找不到產出的影片或音訊檔案。")
+
 
 
 class WhisperTranscriptionService:
@@ -521,6 +641,14 @@ class WhisperTranscriptionService:
                 "output_path": output_path,
             },
         }
+
+
+def parse_quality_height(quality: str) -> Optional[int]:
+    """將畫質選項轉成 yt-dlp 可用的高度限制。"""
+    match = re.search(r"(\d+)", quality or "")
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def collect_environment() -> Dict[str, Any]:
@@ -1140,6 +1268,9 @@ class SubtitleDownloaderGUI:
         self.url_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=DEFAULT_DOWNLOAD_DIR)
         self.format_var = tk.StringVar(value="srt")
+        self.media_format_var = tk.StringVar(value="mp4")
+        self.media_quality_var = tk.StringVar(value="720p")
+        self.media_progress_var = tk.DoubleVar(value=0.0)
         self.status_var = tk.StringVar(value="請貼上 YouTube 連結後按下「讀取字幕」。")
         self.video_info_var = tk.StringVar(value="尚未讀取影片。")
 
@@ -1153,8 +1284,8 @@ class SubtitleDownloaderGUI:
         ctk.set_default_color_theme("blue")
 
         self.root.title(APP_NAME)
-        self.root.geometry("860x720")
-        self.root.minsize(820, 680)
+        self.root.geometry("900x720")
+        self.root.minsize(840, 680)
         self.root.configure(fg_color="#f8fafc")
 
     def create_widgets(self) -> None:
@@ -1224,7 +1355,7 @@ class SubtitleDownloaderGUI:
             border_width=1,
             border_color="#fed7aa",
         )
-        usage.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        usage.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         usage.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -1234,22 +1365,20 @@ class SubtitleDownloaderGUI:
             font=ctk.CTkFont(size=13, weight="bold"),
             width=76,
             anchor="w",
-        ).grid(row=0, column=0, padx=(12, 8), pady=10, sticky="nw")
+        ).grid(row=0, column=0, padx=(12, 8), pady=7, sticky="nw")
 
         ctk.CTkLabel(
             usage,
             text=(
-                "主要流程從左側大型「開始分析 / 讀取字幕」按鈕開始。貼上 YouTube 連結後按下該按鈕，程式會自動分析字幕狀態。"
-                "有 CC 字幕或自動字幕時，右側會出現語系清單，可勾選後直接下載；"
-                "沒有字幕時，會自動開啟語音辨識工具，下載音訊、辨識並產生 SRT 後再另存。"
-                "也可按「辨識工具」處理本機音訊或影片。"
+                "貼上 YouTube 連結後按「開始分析 / 讀取字幕」；有 CC 字幕可直接下載，沒有字幕可用辨識工具產生 SRT。"
+                "下方分頁可切換字幕下載與影片/音訊下載。"
             ),
             text_color="#7c2d12",
             font=ctk.CTkFont(size=12),
             justify="left",
             anchor="w",
             wraplength=720,
-        ).grid(row=0, column=1, padx=(0, 12), pady=10, sticky="ew")
+        ).grid(row=0, column=1, padx=(0, 12), pady=7, sticky="ew")
 
     def create_body(self, parent: ctk.CTkFrame) -> None:
         """
@@ -1294,7 +1423,7 @@ class SubtitleDownloaderGUI:
             parent: 父容器。
         """
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(11, weight=1)
+        parent.grid_rowconfigure(12, weight=1)
 
         ctk.CTkLabel(
             parent,
@@ -1329,13 +1458,13 @@ class SubtitleDownloaderGUI:
             primary_box,
             text="開始分析 / 讀取字幕",
             command=self.load_captions_async,
-            height=50,
+            height=44,
             corner_radius=18,
             fg_color="#e11d48",
             hover_color="#be123c",
             font=ctk.CTkFont(size=16, weight="bold"),
         )
-        self.load_button.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        self.load_button.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
 
         ctk.CTkLabel(
             primary_box,
@@ -1345,70 +1474,10 @@ class SubtitleDownloaderGUI:
             anchor="w",
             justify="left",
             wraplength=280,
-        ).grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
-
-        ctk.CTkLabel(
-            parent,
-            text="字幕儲存資料夾",
-            text_color="#475569",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            anchor="w",
-        ).grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 6))
-
-        output_entry = ctk.CTkEntry(
-            parent,
-            textvariable=self.output_dir_var,
-            height=38,
-            corner_radius=14,
-            border_color="#bae6fd",
-        )
-        output_entry.grid(row=4, column=0, sticky="ew", padx=16)
-
-        choose_button = ctk.CTkButton(
-            parent,
-            text="選擇資料夾",
-            command=self.choose_output_dir,
-            height=34,
-            corner_radius=16,
-            fg_color="#e0f2fe",
-            hover_color="#bae6fd",
-            text_color="#0369a1",
-        )
-        choose_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 10))
-
-        ctk.CTkLabel(
-            parent,
-            text="字幕格式",
-            text_color="#475569",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            anchor="w",
-        ).grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 6))
-
-        format_menu = ctk.CTkOptionMenu(
-            parent,
-            variable=self.format_var,
-            values=["srt", "vtt", "json3", "srv1", "srv2", "srv3", "ttml"],
-            height=36,
-            corner_radius=14,
-            fg_color="#f97316",
-            button_color="#fb7185",
-            button_hover_color="#e11d48",
-        )
-        format_menu.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 10))
-
-        self.download_button = ctk.CTkButton(
-            parent,
-            text="⬇️ 下載選取字幕",
-            command=self.download_selected_async,
-            height=38,
-            corner_radius=18,
-            fg_color="#16a34a",
-            hover_color="#15803d",
-        )
-        self.download_button.grid(row=8, column=0, sticky="ew", padx=16, pady=3)
+        ).grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 9))
 
         utility_row = ctk.CTkFrame(parent, fg_color="transparent")
-        utility_row.grid(row=9, column=0, sticky="ew", padx=16, pady=(3, 8))
+        utility_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
         utility_row.grid_columnconfigure(0, weight=1)
         utility_row.grid_columnconfigure(1, weight=1)
 
@@ -1416,7 +1485,7 @@ class SubtitleDownloaderGUI:
             utility_row,
             text="🎙️ 辨識工具",
             command=self.open_recognition_tool,
-            height=34,
+            height=32,
             corner_radius=16,
             fg_color="#8b5cf6",
             hover_color="#7c3aed",
@@ -1427,7 +1496,7 @@ class SubtitleDownloaderGUI:
             utility_row,
             text="🧹 清除",
             command=self.clear_all,
-            height=34,
+            height=32,
             corner_radius=16,
             fg_color="#e2e8f0",
             hover_color="#cbd5e1",
@@ -1435,10 +1504,151 @@ class SubtitleDownloaderGUI:
         )
         clear_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
+        ctk.CTkLabel(
+            parent,
+            text="字幕儲存資料夾",
+            text_color="#475569",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 5))
+
+        output_row = ctk.CTkFrame(parent, fg_color="transparent")
+        output_row.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
+        output_row.grid_columnconfigure(0, weight=1)
+
+        output_entry = ctk.CTkEntry(
+            output_row,
+            textvariable=self.output_dir_var,
+            height=34,
+            corner_radius=14,
+            border_color="#bae6fd",
+        )
+        output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        choose_button = ctk.CTkButton(
+            output_row,
+            text="選擇",
+            command=self.choose_output_dir,
+            height=34,
+            corner_radius=16,
+            width=74,
+            fg_color="#e0f2fe",
+            hover_color="#bae6fd",
+            text_color="#0369a1",
+        )
+        choose_button.grid(row=0, column=1, sticky="e")
+
+        download_tabs = ctk.CTkTabview(
+            parent,
+            fg_color="#f8fafc",
+            segmented_button_fg_color="#e2e8f0",
+            segmented_button_selected_color="#fb7185",
+            segmented_button_selected_hover_color="#e11d48",
+            text_color="#334155",
+            height=136,
+        )
+        download_tabs.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 6))
+        subtitle_tab = download_tabs.add("字幕")
+        media_tab = download_tabs.add("影片/音訊")
+        subtitle_tab.grid_columnconfigure(0, weight=1)
+        media_tab.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkLabel(
+            subtitle_tab,
+            text="字幕格式",
+            text_color="#475569",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
+
+        format_menu = ctk.CTkOptionMenu(
+            subtitle_tab,
+            variable=self.format_var,
+            values=["srt", "vtt", "json3", "srv1", "srv2", "srv3", "ttml"],
+            height=34,
+            corner_radius=14,
+            fg_color="#f97316",
+            button_color="#fb7185",
+            button_hover_color="#e11d48",
+        )
+        format_menu.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        self.download_button = ctk.CTkButton(
+            subtitle_tab,
+            text="下載選取字幕",
+            command=self.download_selected_async,
+            height=34,
+            corner_radius=16,
+            fg_color="#16a34a",
+            hover_color="#15803d",
+        )
+        self.download_button.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        ctk.CTkLabel(
+            media_tab,
+            text="格式",
+            text_color="#475569",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=(6, 4))
+
+        ctk.CTkLabel(
+            media_tab,
+            text="畫質",
+            text_color="#475569",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8), pady=(6, 4))
+
+        media_format_menu = ctk.CTkOptionMenu(
+            media_tab,
+            variable=self.media_format_var,
+            values=MEDIA_FORMAT_OPTIONS,
+            height=34,
+            corner_radius=14,
+            fg_color="#0f766e",
+            button_color="#14b8a6",
+            button_hover_color="#0d9488",
+        )
+        media_format_menu.grid(row=1, column=0, sticky="ew", padx=(8, 4), pady=(0, 8))
+
+        media_quality_menu = ctk.CTkOptionMenu(
+            media_tab,
+            variable=self.media_quality_var,
+            values=MEDIA_QUALITY_OPTIONS,
+            height=34,
+            corner_radius=14,
+            fg_color="#2563eb",
+            button_color="#3b82f6",
+            button_hover_color="#1d4ed8",
+        )
+        media_quality_menu.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=(0, 8))
+
+        self.media_download_button = ctk.CTkButton(
+            media_tab,
+            text="下載影片/音訊",
+            command=self.download_media_async,
+            height=34,
+            corner_radius=16,
+            fg_color="#0f766e",
+            hover_color="#115e59",
+        )
+        self.media_download_button.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+
         status_box = ctk.CTkFrame(parent, fg_color="#f8fafc", corner_radius=16)
-        status_box.grid(row=11, column=0, sticky="nsew", padx=16, pady=(4, 16))
+        status_box.grid(row=12, column=0, sticky="nsew", padx=16, pady=(0, 12))
         status_box.grid_columnconfigure(0, weight=1)
-        status_box.grid_rowconfigure(0, weight=1)
+        status_box.grid_rowconfigure(1, weight=1)
+
+        self.media_progress_bar = ctk.CTkProgressBar(
+            status_box,
+            variable=self.media_progress_var,
+            height=8,
+            corner_radius=8,
+            progress_color="#0f766e",
+        )
+        self.media_progress_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        self.media_progress_bar.set(0)
 
         status_label = ctk.CTkLabel(
             status_box,
@@ -1449,7 +1659,7 @@ class SubtitleDownloaderGUI:
             anchor="nw",
             wraplength=260,
         )
-        status_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=(10, 4))
+        status_label.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6, 6))
 
     def create_right_panel(self, parent: ctk.CTkFrame) -> None:
         """
@@ -1753,6 +1963,57 @@ class SubtitleDownloaderGUI:
         except Exception as exc:
             self.message_queue.put(("download_error", str(exc)))
 
+    def download_media_async(self) -> None:
+        """背景下載 YouTube 影片或音訊。"""
+        youtube_url = self.url_var.get().strip()
+        output_dir = self.output_dir_var.get().strip()
+        media_format = self.media_format_var.get().strip()
+        quality = self.media_quality_var.get().strip()
+
+        if not youtube_url:
+            messagebox.showwarning(APP_NAME, "請先貼上 YouTube 影片連結。")
+            return
+
+        if media_format == "mp3" and shutil.which("ffmpeg") is None:
+            messagebox.showwarning(APP_NAME, "下載 MP3 需要 ffmpeg，請先安裝 ffmpeg 或改選 mp4。")
+            return
+
+        self.media_download_button.configure(state="disabled")
+        self.media_progress_var.set(0.0)
+        self.media_progress_bar.set(0)
+        self.status_var.set(f"正在下載 {media_format.upper()}，請稍候……")
+
+        thread = threading.Thread(
+            target=self.download_media_worker,
+            args=(youtube_url, output_dir, media_format, quality),
+            daemon=True,
+        )
+        thread.start()
+
+    def download_media_worker(self, youtube_url: str, output_dir: str, media_format: str, quality: str) -> None:
+        """
+        背景工作：下載 YouTube 影片或音訊。
+
+        Args:
+            youtube_url: YouTube 影片連結。
+            output_dir: 輸出資料夾。
+            media_format: 下載格式。
+            quality: 影片畫質。
+        """
+        try:
+            file_path = self.service.download_youtube_media(
+                youtube_url=youtube_url,
+                output_dir=output_dir,
+                media_format=media_format,
+                quality=quality,
+                progress_callback=lambda message, progress: self.message_queue.put(
+                    ("media_status", json.dumps({"message": message, "progress": progress}, ensure_ascii=False))
+                ),
+            )
+            self.message_queue.put(("media_success", file_path))
+        except Exception as exc:
+            self.message_queue.put(("media_error", str(exc)))
+
     def open_recognition_tool(self, youtube_url: str = "", video_title: str = "") -> None:
         """開啟 Whisper 辨識工具；無 CC 的 YouTube 會帶入網址。"""
         if self.recognition_window is not None and self.recognition_window.winfo_exists():
@@ -1779,6 +2040,8 @@ class SubtitleDownloaderGUI:
         self.url_var.set("")
         self.video_info_var.set("尚未讀取影片。")
         self.render_empty_caption_message("尚未讀取字幕。")
+        self.media_progress_var.set(0.0)
+        self.media_progress_bar.set(0)
         self.status_var.set("請貼上 YouTube 連結後按下「讀取字幕」。")
 
     def poll_message_queue(self) -> None:
@@ -1795,6 +2058,12 @@ class SubtitleDownloaderGUI:
                     self.handle_download_success(payload)
                 elif event_type == "download_error":
                     self.handle_download_error(payload)
+                elif event_type == "media_status":
+                    self.handle_media_status(payload)
+                elif event_type == "media_success":
+                    self.handle_media_success(payload)
+                elif event_type == "media_error":
+                    self.handle_media_error(payload)
         except queue.Empty:
             pass
 
@@ -1869,6 +2138,36 @@ class SubtitleDownloaderGUI:
         self.download_button.configure(state="normal")
 
         messagebox.showerror(APP_NAME, f"下載失敗：\n{message}")
+
+    def handle_media_status(self, payload: str) -> None:
+        """處理影片或音訊下載進度。"""
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            self.status_var.set(payload)
+            return
+
+        self.status_var.set(str(data.get("message") or "正在下載影片/音訊……"))
+        progress = data.get("progress")
+        if progress is not None:
+            self.media_progress_var.set(float(progress))
+            self.media_progress_bar.set(float(progress))
+
+    def handle_media_success(self, file_path: str) -> None:
+        """處理影片或音訊下載成功。"""
+        self.media_progress_var.set(1.0)
+        self.media_progress_bar.set(1)
+        self.status_var.set(f"影片/音訊下載完成：\n{file_path}")
+        self.media_download_button.configure(state="normal")
+        messagebox.showinfo(APP_NAME, f"影片/音訊下載完成！\n\n{file_path}")
+
+    def handle_media_error(self, message: str) -> None:
+        """處理影片或音訊下載失敗。"""
+        self.media_progress_var.set(0.0)
+        self.media_progress_bar.set(0)
+        self.status_var.set(f"影片/音訊下載失敗：{message}")
+        self.media_download_button.configure(state="normal")
+        messagebox.showerror(APP_NAME, f"影片/音訊下載失敗：\n{message}")
 
 
 def main() -> None:

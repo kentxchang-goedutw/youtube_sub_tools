@@ -31,17 +31,18 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 import yt_dlp
 
 
-APP_NAME = "YouTube 多語系字幕下載工具"
+APP_NAME = "YouTube字幕下載整合工具"
 AUTHOR_NAME = "阿剛老師"
 AUTHOR_URL = "https://kentxchang.blogspot.tw"
 CC_LICENSE_TEXT = (
@@ -51,7 +52,7 @@ CC_LICENSE_TEXT = (
 RECOGNITION_USAGE_TEXT = (
     "辨識工具說明：可處理沒有 CC 字幕的 YouTube 影片，也可選擇本機音訊或影片。"
     "請先確認模型、語言、裝置與切割粒度；按「開始辨識」後會產生逐字稿與 SRT，"
-    "完成後可使用「另存 SRT」或「複製 SRT」下載/取用字幕。"
+    "完成後可使用「另存 SRT」或「下載逐字稿」取用輸出。"
 )
 DEFAULT_DOWNLOAD_DIR = str(Path.home() / "Downloads" / "YouTube字幕下載")
 APP_DIR = Path(__file__).resolve().parent
@@ -60,6 +61,10 @@ WHISPER_MEDIA_DIR = WHISPER_OUTPUT_DIR / "youtube_media"
 ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm", ".mkv", ".mov", ".aac", ".flac"}
 MEDIA_QUALITY_OPTIONS = ["最佳", "1080p", "720p", "480p", "360p", "240p", "144p"]
 MEDIA_FORMAT_OPTIONS = ["mp4", "mp3"]
+FFMPEG_HELPER_PACKAGE = "imageio-ffmpeg"
+FFMPEG_WINDOWS_ZIP_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+_ffmpeg_executable_cache: Optional[Path] = None
+_ffmpeg_install_lock = threading.Lock()
 
 SEGMENT_RULES = {
     "fine": {"label": "細緻", "max_chars": 24, "max_duration": 4.2, "punctuation": "，。！？；,.!?;"},
@@ -90,6 +95,185 @@ def resource_path(relative_path: str) -> Path:
     """
     base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base_dir / relative_path
+
+
+def get_runtime_data_dir() -> Path:
+    """取得可寫入的使用者資料目錄，供 exe 存放首次下載的工具。"""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "YouTubeSubtitleTool"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "YouTubeSubtitleTool"
+    return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "YouTubeSubtitleTool"
+
+
+def get_downloaded_ffmpeg_path() -> Path:
+    return get_runtime_data_dir() / "ffmpeg" / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+
+
+def resolve_ffmpeg_executable(refresh: bool = False) -> Optional[Path]:
+    """找出系統或 imageio-ffmpeg 提供的 ffmpeg 執行檔。"""
+    global _ffmpeg_executable_cache
+
+    if not refresh and _ffmpeg_executable_cache and _ffmpeg_executable_cache.exists():
+        return _ffmpeg_executable_cache
+
+    downloaded = get_downloaded_ffmpeg_path()
+    if downloaded.exists():
+        _ffmpeg_executable_cache = downloaded
+        return downloaded
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        _ffmpeg_executable_cache = Path(system_ffmpeg)
+        return _ffmpeg_executable_cache
+
+    try:
+        if importlib.util.find_spec("imageio_ffmpeg") is not None:
+            import imageio_ffmpeg
+
+            bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
+            if bundled.exists():
+                _ffmpeg_executable_cache = bundled
+                return bundled
+    except Exception:
+        return None
+
+    _ffmpeg_executable_cache = None
+    return None
+
+
+def download_windows_ffmpeg(progress_callback: Optional[Callable[[str], None]] = None) -> Path:
+    """下載 Windows 版 FFmpeg zip，解出 ffmpeg.exe 到使用者資料目錄。"""
+
+    def notify(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("目前自動下載 FFmpeg 僅支援 Windows；macOS 請使用 Homebrew 或系統套件安裝 FFmpeg。")
+
+    target = get_downloaded_ffmpeg_path()
+    if target.exists():
+        return target
+
+    ffmpeg_dir = target.parent
+    ffmpeg_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = ffmpeg_dir / "ffmpeg-download.zip"
+    temp_extract_dir = ffmpeg_dir / "_extract"
+
+    if temp_extract_dir.exists():
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+    temp_extract_dir.mkdir(parents=True, exist_ok=True)
+
+    notify("系統缺少 FFmpeg，正在背景下載 Windows 版 FFmpeg，請等待。")
+    request = urllib.request.Request(
+        FFMPEG_WINDOWS_ZIP_URL,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, zip_path.open("wb") as output:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            last_reported = -1
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    percent = int(downloaded / total * 100)
+                    if percent >= last_reported + 5:
+                        last_reported = percent
+                        notify(f"正在下載 Windows 版 FFmpeg：{percent}%")
+
+        notify("FFmpeg 下載完成，正在解壓縮。")
+        with zipfile.ZipFile(zip_path) as archive:
+            ffmpeg_member = next(
+                (name for name in archive.namelist() if name.lower().endswith("/bin/ffmpeg.exe")),
+                None,
+            )
+            if not ffmpeg_member:
+                raise RuntimeError("下載的 FFmpeg 壓縮檔內找不到 ffmpeg.exe。")
+            archive.extract(ffmpeg_member, temp_extract_dir)
+            extracted = temp_extract_dir / ffmpeg_member
+            shutil.copy2(extracted, target)
+    except Exception:
+        if target.exists():
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        zip_path.unlink(missing_ok=True)
+        shutil.rmtree(temp_extract_dir, ignore_errors=True)
+
+    if not target.exists():
+        raise RuntimeError("FFmpeg 解壓縮完成，但找不到 ffmpeg.exe。")
+    notify(f"FFmpeg 已準備完成：{target}")
+    return target
+
+
+def ensure_ffmpeg_available(progress_callback: Optional[Callable[[str], None]] = None) -> Optional[Path]:
+    """
+    確保 ffmpeg 可用。Windows exe 會首次下載 FFmpeg；Python 原始碼執行時可用 imageio-ffmpeg 備援。
+    """
+    global _ffmpeg_executable_cache
+
+    def notify(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    existing = resolve_ffmpeg_executable()
+    if existing:
+        return existing
+
+    with _ffmpeg_install_lock:
+        existing = resolve_ffmpeg_executable(refresh=True)
+        if existing:
+            return existing
+
+        if sys.platform.startswith("win"):
+            resolved = download_windows_ffmpeg(notify)
+            _ffmpeg_executable_cache = resolved
+            return resolved
+
+        notify("系統缺少 FFmpeg，正在背景下載 imageio-ffmpeg（內含 FFmpeg），請等待。")
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--disable-pip-version-check",
+            FFMPEG_HELPER_PACKAGE,
+        ]
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                env=env,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"FFmpeg 自動下載失敗，請手動安裝 FFmpeg 或 imageio-ffmpeg：{exc}") from exc
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            if len(detail) > 800:
+                detail = detail[-800:]
+            raise RuntimeError(f"FFmpeg 自動下載失敗，請手動安裝 FFmpeg 或 imageio-ffmpeg。\n{detail}")
+
+        importlib.invalidate_caches()
+        resolved = resolve_ffmpeg_executable(refresh=True)
+        if not resolved:
+            raise RuntimeError("FFmpeg 下載完成，但仍找不到可用的 ffmpeg 執行檔。")
+
+        notify(f"FFmpeg 已準備完成：{resolved}")
+        return resolved
 
 
 class SubtitleService:
@@ -131,6 +315,8 @@ class SubtitleService:
             "noplaylist": True,
             "ignoreerrors": False,
             "extract_flat": False,
+            "color": {"stdout": "no_color", "stderr": "no_color"},
+            "logger": QuietYDLLogger(),
         }
 
     def get_video_info(self, youtube_url: str) -> Dict[str, Any]:
@@ -155,7 +341,7 @@ class SubtitleService:
             with yt_dlp.YoutubeDL(self.build_ydl_options()) as ydl:
                 info = ydl.extract_info(youtube_url, download=False)
         except Exception as exc:
-            raise ValueError(f"無法讀取影片資訊：{exc}") from exc
+            raise ValueError(f"無法讀取影片資訊：{format_youtube_error(exc)}") from exc
 
         if not info:
             raise ValueError("無法取得影片資訊。")
@@ -181,6 +367,9 @@ class SubtitleService:
 
         for language_code, formats in subtitles.items():
             if isinstance(formats, list):
+                available_formats = self.extract_available_formats(formats)
+                if "srt" not in available_formats:
+                    continue
                 tracks.append(
                     {
                         "index": index,
@@ -188,7 +377,7 @@ class SubtitleService:
                         "name": self.guess_language_name(language_code),
                         "kind": "manual",
                         "kind_label": "手動字幕",
-                        "formats": self.extract_available_formats(formats),
+                        "formats": available_formats,
                         "raw_formats": formats,
                     }
                 )
@@ -196,6 +385,9 @@ class SubtitleService:
 
         for language_code, formats in automatic_captions.items():
             if isinstance(formats, list):
+                available_formats = self.extract_available_formats(formats)
+                if "srt" not in available_formats:
+                    continue
                 tracks.append(
                     {
                         "index": index,
@@ -203,7 +395,7 @@ class SubtitleService:
                         "name": self.guess_language_name(language_code),
                         "kind": "auto",
                         "kind_label": "自動產生字幕",
-                        "formats": self.extract_available_formats(formats),
+                        "formats": available_formats,
                         "raw_formats": formats,
                     }
                 )
@@ -366,7 +558,7 @@ class SubtitleService:
             with urllib.request.urlopen(request_obj, timeout=30) as response:
                 file_path.write_bytes(response.read())
         except Exception as exc:
-            raise ValueError(f"字幕下載失敗：{exc}") from exc
+            raise ValueError(f"字幕下載失敗：{clean_error_message(exc)}") from exc
 
         return str(file_path)
 
@@ -412,7 +604,12 @@ class SubtitleService:
             "noplaylist": True,
             "restrictfilenames": True,
             "progress_hooks": [progress_hook],
+            "color": {"stdout": "no_color", "stderr": "no_color"},
+            "logger": QuietYDLLogger(),
         }
+        ffmpeg_path = resolve_ffmpeg_executable()
+        if ffmpeg_path:
+            options["ffmpeg_location"] = str(ffmpeg_path)
 
         notify("正在下載沒有 CC 字幕的 YouTube 影片音訊。")
         try:
@@ -433,7 +630,7 @@ class SubtitleService:
                 if candidates:
                     return candidates[0]
         except Exception as exc:
-            raise ValueError(f"YouTube 音訊下載失敗：{exc}") from exc
+            raise ValueError(f"YouTube 音訊下載失敗：{format_youtube_error(exc)}") from exc
 
         raise ValueError("YouTube 音訊下載完成，但找不到輸出的媒體檔。")
 
@@ -488,9 +685,16 @@ class SubtitleService:
             "noplaylist": True,
             "restrictfilenames": True,
             "progress_hooks": [progress_hook],
+            "color": {"stdout": "no_color", "stderr": "no_color"},
+            "logger": QuietYDLLogger(),
         }
+        ffmpeg_path = resolve_ffmpeg_executable()
 
         if target_format == "mp3":
+            if not ffmpeg_path:
+                ffmpeg_path = ensure_ffmpeg_available(lambda message: notify(message, None))
+            if ffmpeg_path:
+                options["ffmpeg_location"] = str(ffmpeg_path)
             options.update(
                 {
                     "format": "bestaudio/best",
@@ -506,7 +710,9 @@ class SubtitleService:
             notify("正在下載 YouTube 音訊並轉成 MP3。")
         else:
             height = parse_quality_height(quality)
-            ffmpeg_available = shutil.which("ffmpeg") is not None
+            ffmpeg_available = ffmpeg_path is not None
+            if ffmpeg_path:
+                options["ffmpeg_location"] = str(ffmpeg_path)
             if height is None and ffmpeg_available:
                 video_format = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best[ext=mp4]/best"
             elif height is None:
@@ -529,7 +735,7 @@ class SubtitleService:
                 info = ydl.extract_info(youtube_url, download=True)
                 prepared = Path(ydl.prepare_filename(info))
         except Exception as exc:
-            raise ValueError(f"YouTube 影片下載失敗：{exc}") from exc
+            raise ValueError(f"YouTube 影片下載失敗：{format_youtube_error(exc)}") from exc
 
         video_id = str(info.get("id") or "")
         candidates = sorted(output_path.glob(f"*{video_id}*.{target_format}"), key=lambda path: path.stat().st_mtime, reverse=True)
@@ -652,7 +858,7 @@ def parse_quality_height(quality: str) -> Optional[int]:
 
 
 def collect_environment() -> Dict[str, Any]:
-    package_names = ["customtkinter", "yt_dlp", "faster_whisper", "ctranslate2", "av", "onnxruntime"]
+    package_names = ["customtkinter", "yt_dlp", "imageio_ffmpeg", "faster_whisper", "ctranslate2", "av", "onnxruntime"]
     packages = {name: package_available(name) for name in package_names}
     cuda_devices = 0
     ctranslate2_error = None
@@ -667,7 +873,8 @@ def collect_environment() -> Dict[str, Any]:
 
     return {
         "python": sys.version.split()[0],
-        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "ffmpeg": resolve_ffmpeg_executable() is not None,
+        "ffmpeg_path": str(resolve_ffmpeg_executable() or ""),
         "packages": packages,
         "nvidia_smi": check_nvidia_smi(),
         "cuda_device_count": cuda_devices,
@@ -846,14 +1053,38 @@ def readable_bytes(bytes_count: int) -> str:
     return f"{value:.0f} {units[unit]}" if unit == 0 else f"{value:.1f} {units[unit]}"
 
 
+def clean_error_message(error: Any) -> str:
+    """移除 yt-dlp 等工具回傳的 ANSI 控制碼與多餘前綴。"""
+    text = str(error or "").strip()
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    text = re.sub(r"\[0;?\d*m", "", text)
+    text = re.sub(r"(?i)^ERROR:\s*", "", text).strip()
+    return text or "未知錯誤"
+
+
+def format_youtube_error(error: Any) -> str:
+    message = clean_error_message(error)
+    lowered = message.lower()
+    if "video unavailable" in lowered or "this video is not available" in lowered:
+        return (
+            "這支影片目前無法由 YouTube 讀取。可能原因：影片已刪除、設為私人、限定地區/年齡，"
+            "或貼上的網址 ID 有誤。\n\n"
+            f"原始訊息：{message}"
+        )
+    return message
+
+
 def open_folder(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    if sys.platform.startswith("win"):
-        subprocess.Popen(["explorer", str(path)])
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(path)])
-    else:
-        subprocess.Popen(["xdg-open", str(path)])
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as exc:
+        messagebox.showerror(APP_NAME, f"無法開啟資料夾：\n{path}\n\n{exc}")
 
 
 def set_window_icon(root: ctk.CTk) -> None:
@@ -879,6 +1110,19 @@ subtitle_service = SubtitleService()
 whisper_service = WhisperTranscriptionService()
 
 
+class QuietYDLLogger:
+    """避免 yt-dlp 將錯誤直接印到終端或打包後的背景輸出。"""
+
+    def debug(self, _message: str) -> None:
+        pass
+
+    def warning(self, _message: str) -> None:
+        pass
+
+    def error(self, _message: str) -> None:
+        pass
+
+
 class RecognitionWindow(ctk.CTkToplevel):
     """YouTube 無字幕與本機媒體共用的 Whisper 辨識工具。"""
 
@@ -888,6 +1132,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         youtube_url: str = "",
         video_title: str = "",
         service: Optional[SubtitleService] = None,
+        output_dir_var: Optional[tk.StringVar] = None,
     ) -> None:
         super().__init__(master)
         self.youtube_url = youtube_url
@@ -897,6 +1142,8 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.events: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.worker: Optional[threading.Thread] = None
         self.file_path: Optional[Path] = None
+        self.output_dir_var = output_dir_var or tk.StringVar(value=DEFAULT_DOWNLOAD_DIR)
+        self.last_transcript = ""
         self.last_srt = ""
         self.last_output_path: Optional[Path] = None
 
@@ -905,6 +1152,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.device_var = tk.StringVar(value="auto")
         self.compute_var = tk.StringVar(value="float16")
         self.segment_var = tk.StringVar(value="standard")
+        self.youtube_url_var = tk.StringVar(value=youtube_url)
         self.status_var = tk.StringVar(value="YouTube 無 CC 字幕，按「開始辨識」會先下載音訊再產生 SRT。" if youtube_url else "請選擇媒體檔或貼回主畫面讀取 YouTube。")
         self.source_title_var = tk.StringVar(value=video_title or youtube_url or "可選擇音訊或影片檔進行辨識")
         self.file_var = tk.StringVar(value="來源：YouTube 影片" if youtube_url else "尚未選擇媒體檔")
@@ -934,7 +1182,7 @@ class RecognitionWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             hero,
-            text="YouTube 字幕下載生成工具",
+            text="YouTube及本地影音字幕生成工具",
             text_color="#f64b88",
             font=ctk.CTkFont(family="Microsoft JhengHei UI", size=24, weight="bold"),
         ).grid(row=0, column=1, padx=(0, 18), pady=(10, 2), sticky="w")
@@ -996,6 +1244,27 @@ class RecognitionWindow(ctk.CTkToplevel):
             row=0, column=1, rowspan=2, padx=(8, 14), pady=12, sticky="e"
         )
 
+        youtube_row = ctk.CTkFrame(source_box, fg_color="transparent")
+        youtube_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 12))
+        youtube_row.grid_columnconfigure(0, weight=1)
+
+        youtube_entry = ctk.CTkEntry(
+            youtube_row,
+            textvariable=self.youtube_url_var,
+            placeholder_text="貼上 YouTube 網址作為辨識來源",
+            height=34,
+        )
+        youtube_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        youtube_entry.bind("<Return>", lambda _event: self.apply_youtube_url())
+
+        ctk.CTkButton(
+            youtube_row,
+            text="使用網址",
+            width=92,
+            height=34,
+            command=self.apply_youtube_url,
+        ).grid(row=0, column=1, sticky="e")
+
         settings = ctk.CTkFrame(parent, fg_color="transparent")
         settings.grid(row=2, column=0, padx=18, pady=(10, 0), sticky="ew")
         settings.grid_columnconfigure((0, 1), weight=1)
@@ -1036,7 +1305,7 @@ class RecognitionWindow(ctk.CTkToplevel):
         save_actions.grid_columnconfigure((0, 1), weight=1)
         self.save_button = ctk.CTkButton(save_actions, text="另存 SRT", height=34, command=self.save_as, state="disabled")
         self.save_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
-        ctk.CTkButton(save_actions, text="打開輸出資料夾", height=34, command=lambda: open_folder(WHISPER_OUTPUT_DIR)).grid(
+        ctk.CTkButton(save_actions, text="打開輸出資料夾", height=34, command=self.open_output_dir).grid(
             row=0, column=1, padx=(6, 0), sticky="ew"
         )
 
@@ -1067,8 +1336,8 @@ class RecognitionWindow(ctk.CTkToplevel):
         output_actions = ctk.CTkFrame(parent, fg_color="transparent")
         output_actions.grid(row=2, column=0, padx=18, pady=(12, 18), sticky="ew")
         output_actions.grid_columnconfigure((0, 1), weight=1)
-        self.copy_button = ctk.CTkButton(output_actions, text="複製 SRT", height=36, command=self.copy_srt, state="disabled")
-        self.copy_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        self.transcript_button = ctk.CTkButton(output_actions, text="下載逐字稿", height=36, command=self.save_transcript_as, state="disabled")
+        self.transcript_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
         ctk.CTkButton(output_actions, text="清除輸出", height=36, fg_color="#6758e8", hover_color="#5749cb", command=self.clear_outputs).grid(
             row=0, column=1, padx=(6, 0), sticky="ew"
         )
@@ -1104,16 +1373,33 @@ class RecognitionWindow(ctk.CTkToplevel):
                 return
 
         self.file_path = selected
+        self.youtube_url = ""
+        self.video_title = ""
+        self.youtube_url_var.set("")
         self.source_title_var.set("本機媒體檔")
         self.file_var.set(f"{selected.name}\n{readable_bytes(selected.stat().st_size)}")
         self.status_var.set("本機檔案已就緒，可以開始辨識。")
+
+    def apply_youtube_url(self) -> None:
+        youtube_url = self.youtube_url_var.get().strip()
+        if not youtube_url:
+            messagebox.showwarning("尚未輸入網址", "請先貼上 YouTube 網址。")
+            return
+
+        self.youtube_url = youtube_url
+        self.video_title = ""
+        self.file_path = None
+        self.source_title_var.set(youtube_url)
+        self.file_var.set("來源：YouTube 影片")
+        self.status_var.set("YouTube 網址已設定，按「開始辨識」會先下載音訊再產生 SRT。")
 
     def check_environment(self) -> None:
         env = collect_environment()
         text = [
             f"Python：{env['python']}",
             f"執行位置：{APP_DIR}",
-            f"ffmpeg：{'可用' if env['ffmpeg'] else '未在 PATH 偵測到'}",
+            f"ffmpeg：{'可用' if env['ffmpeg'] else '未偵測到'}",
+            f"ffmpeg 位置：{env['ffmpeg_path'] or '尚未準備完成'}",
             f"nvidia-smi：{env['nvidia_smi']['text']}",
             f"CUDA 裝置數：{env['cuda_device_count']}",
             f"建議裝置：{env['recommended_device']}",
@@ -1143,6 +1429,7 @@ class RecognitionWindow(ctk.CTkToplevel):
             "device": self.device_var.get(),
             "compute_type": self.compute_var.get(),
             "segment_mode": self.segment_var.get(),
+            "output_dir": self.output_dir_var.get(),
         }
 
         self.clear_outputs()
@@ -1169,7 +1456,7 @@ class RecognitionWindow(ctk.CTkToplevel):
                 device_request=str(config["device"]),
                 compute_request=str(config["compute_type"]),
                 segment_mode=str(config["segment_mode"]),
-                output_dir=WHISPER_OUTPUT_DIR,
+                output_dir=Path(str(config["output_dir"])),
                 progress_callback=lambda message: self.events.put(("status", message)),
             )
             self.events.put(("done", result))
@@ -1198,15 +1485,19 @@ class RecognitionWindow(ctk.CTkToplevel):
         self.after(160, self.poll_events)
 
     def render_result(self, payload: Dict[str, Any]) -> None:
+        self.last_transcript = str(payload["transcript"])
         self.last_srt = str(payload["srt"])
         self.last_output_path = Path(payload["meta"]["output_path"])
-        self.set_text(self.transcript_text, str(payload["transcript"]))
+        self.set_text(self.transcript_text, self.last_transcript)
         self.set_text(self.srt_text, self.last_srt)
         meta = payload["meta"]
         self.meta_var.set(f"{meta['segments']} 段 · {meta['device']} · {meta['elapsed']} 秒")
         self.save_button.configure(state="normal")
-        self.copy_button.configure(state="normal")
+        self.transcript_button.configure(state="normal")
         self.status_var.set(f"辨識完成，已輸出：{self.last_output_path}")
+
+    def open_output_dir(self) -> None:
+        open_folder(Path(self.output_dir_var.get().strip() or DEFAULT_DOWNLOAD_DIR))
 
     def save_as(self) -> None:
         if not self.last_srt:
@@ -1216,25 +1507,37 @@ class RecognitionWindow(ctk.CTkToplevel):
             title="另存 SRT",
             defaultextension=".srt",
             initialfile=default_name,
+            initialdir=self.output_dir_var.get().strip() or DEFAULT_DOWNLOAD_DIR,
             filetypes=[("SRT 字幕", "*.srt"), ("所有檔案", "*.*")],
         )
         if path:
             Path(path).write_text("\ufeff" + self.last_srt, encoding="utf-8")
             self.status_var.set(f"已另存：{path}")
 
-    def copy_srt(self) -> None:
-        if not self.last_srt:
+    def save_transcript_as(self) -> None:
+        if not self.last_transcript:
             return
-        self.clipboard_clear()
-        self.clipboard_append(self.last_srt)
-        self.status_var.set("已複製 SRT 到剪貼簿。")
+        default_name = "transcript.txt"
+        if self.last_output_path:
+            default_name = f"{self.last_output_path.stem}.txt"
+        path = filedialog.asksaveasfilename(
+            title="下載逐字稿",
+            defaultextension=".txt",
+            initialfile=default_name,
+            initialdir=self.output_dir_var.get().strip() or DEFAULT_DOWNLOAD_DIR,
+            filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")],
+        )
+        if path:
+            Path(path).write_text("\ufeff" + self.last_transcript, encoding="utf-8")
+            self.status_var.set(f"逐字稿已儲存：{path}")
 
     def clear_outputs(self) -> None:
+        self.last_transcript = ""
         self.last_srt = ""
         self.last_output_path = None
         self.meta_var.set("")
         self.save_button.configure(state="disabled")
-        self.copy_button.configure(state="disabled")
+        self.transcript_button.configure(state="disabled")
         self.set_text(self.transcript_text, "")
         self.set_text(self.srt_text, "")
 
@@ -1263,11 +1566,14 @@ class SubtitleDownloaderGUI:
         self.service = subtitle_service
         self.message_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self.caption_check_vars: Dict[int, tk.BooleanVar] = {}
+        self.caption_tree: Optional[ttk.Treeview] = None
+        self.caption_tree_items: Dict[int, str] = {}
+        self.caption_tree_rows: Dict[int, Tuple[str, str, str]] = {}
+        self.ffmpeg_worker: Optional[threading.Thread] = None
         self.recognition_window: Optional[RecognitionWindow] = None
 
         self.url_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=DEFAULT_DOWNLOAD_DIR)
-        self.format_var = tk.StringVar(value="srt")
         self.media_format_var = tk.StringVar(value="mp4")
         self.media_quality_var = tk.StringVar(value="720p")
         self.media_progress_var = tk.DoubleVar(value=0.0)
@@ -1277,6 +1583,7 @@ class SubtitleDownloaderGUI:
         self.setup_window()
         self.create_widgets()
         self.poll_message_queue()
+        self.ensure_ffmpeg_async()
 
     def setup_window(self) -> None:
         """設定主視窗外觀。"""
@@ -1555,34 +1862,22 @@ class SubtitleDownloaderGUI:
 
         ctk.CTkLabel(
             subtitle_tab,
-            text="字幕格式",
+            text="僅下載 YouTube 原生 SRT 字幕",
             text_color="#475569",
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 4))
-
-        format_menu = ctk.CTkOptionMenu(
-            subtitle_tab,
-            variable=self.format_var,
-            values=["srt", "vtt", "json3", "srv1", "srv2", "srv3", "ttml"],
-            height=34,
-            corner_radius=14,
-            fg_color="#f97316",
-            button_color="#fb7185",
-            button_hover_color="#e11d48",
-        )
-        format_menu.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 8))
 
         self.download_button = ctk.CTkButton(
             subtitle_tab,
-            text="下載選取字幕",
+            text="下載選取 SRT 字幕",
             command=self.download_selected_async,
             height=34,
             corner_radius=16,
             fg_color="#16a34a",
             hover_color="#15803d",
         )
-        self.download_button.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.download_button.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 10))
 
         ctk.CTkLabel(
             media_tab,
@@ -1715,16 +2010,59 @@ class SubtitleDownloaderGUI:
         )
         select_none_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
-        self.caption_scroll = ctk.CTkScrollableFrame(
+        caption_list_box = ctk.CTkFrame(
             parent,
             fg_color="#ffffff",
             corner_radius=18,
-            scrollbar_button_color="#fb7185",
-            scrollbar_button_hover_color="#e11d48",
-            height=300,
+            border_width=1,
+            border_color="#e2e8f0",
         )
-        self.caption_scroll.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
-        self.caption_scroll.grid_columnconfigure(0, weight=1)
+        caption_list_box.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        caption_list_box.grid_columnconfigure(0, weight=1)
+        caption_list_box.grid_rowconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.configure(
+            "Caption.Treeview",
+            rowheight=38,
+            font=("Microsoft JhengHei UI", 11),
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            borderwidth=0,
+        )
+        style.configure(
+            "Caption.Treeview.Heading",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+            background="#f8fafc",
+            foreground="#334155",
+        )
+        style.map("Caption.Treeview", background=[("selected", "#e0f2fe")], foreground=[("selected", "#075985")])
+
+        self.caption_tree = ttk.Treeview(
+            caption_list_box,
+            columns=("checked", "language", "kind", "formats"),
+            show="headings",
+            selectmode="none",
+            style="Caption.Treeview",
+        )
+        self.caption_tree.heading("checked", text="選取")
+        self.caption_tree.heading("language", text="語系")
+        self.caption_tree.heading("kind", text="類型")
+        self.caption_tree.heading("formats", text="格式")
+        self.caption_tree.column("checked", width=54, minwidth=48, stretch=False, anchor="center")
+        self.caption_tree.column("language", width=165, minwidth=120, stretch=True, anchor="w")
+        self.caption_tree.column("kind", width=105, minwidth=88, stretch=False, anchor="w")
+        self.caption_tree.column("formats", width=145, minwidth=100, stretch=True, anchor="w")
+        self.caption_tree.tag_configure("odd", background="#f8fafc")
+        self.caption_tree.tag_configure("even", background="#ffffff")
+        self.caption_tree.tag_configure("message", foreground="#64748b")
+        self.caption_tree.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+        self.caption_tree.bind("<Button-1>", self.on_caption_tree_click)
+        self.caption_tree.bind("<space>", self.on_caption_tree_space)
+
+        scrollbar = ttk.Scrollbar(caption_list_box, orient="vertical", command=self.caption_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 10), pady=10)
+        self.caption_tree.configure(yscrollcommand=scrollbar.set)
 
         self.render_empty_caption_message("尚未讀取字幕。")
 
@@ -1774,15 +2112,8 @@ class SubtitleDownloaderGUI:
             message: 顯示文字。
         """
         self.clear_caption_list()
-
-        label = ctk.CTkLabel(
-            self.caption_scroll,
-            text=message,
-            text_color="#64748b",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            anchor="w",
-        )
-        label.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        if self.caption_tree is not None:
+            self.caption_tree.insert("", "end", iid="caption_message", values=("", message, "", ""), tags=("message",))
 
     def choose_output_dir(self) -> None:
         """選擇輸出資料夾。"""
@@ -1792,10 +2123,11 @@ class SubtitleDownloaderGUI:
 
     def clear_caption_list(self) -> None:
         """清空字幕清單。"""
-        for widget in self.caption_scroll.winfo_children():
-            widget.destroy()
-
+        if self.caption_tree is not None:
+            self.caption_tree.delete(*self.caption_tree.get_children())
         self.caption_check_vars.clear()
+        self.caption_tree_items.clear()
+        self.caption_tree_rows.clear()
 
     def render_caption_list(self, tracks: List[Dict[str, Any]]) -> None:
         """
@@ -1811,57 +2143,68 @@ class SubtitleDownloaderGUI:
             return
 
         for position, track in enumerate(tracks):
+            track_index = int(track["index"])
             var = tk.BooleanVar(value=position == 0)
-            self.caption_check_vars[int(track["index"])] = var
+            self.caption_check_vars[track_index] = var
 
-            item_frame = ctk.CTkFrame(
-                self.caption_scroll,
-                fg_color="#f0f9ff",
-                corner_radius=16,
-                border_width=1,
-                border_color="#bae6fd",
-            )
-            item_frame.grid(row=position, column=0, sticky="ew", padx=4, pady=5)
-            item_frame.grid_columnconfigure(1, weight=1)
-
-            checkbox = ctk.CTkCheckBox(
-                item_frame,
-                text="",
-                variable=var,
-                width=28,
-                checkbox_width=20,
-                checkbox_height=20,
-                corner_radius=6,
-                fg_color="#fb7185",
-                hover_color="#e11d48",
-            )
-            checkbox.grid(row=0, column=0, rowspan=2, sticky="nw", padx=(10, 6), pady=12)
-
-            title_text = f"{track['name']}｜{track['kind_label']}"
+            language_text = f"{track['name']} ({track['language_code']})"
+            kind_text = str(track["kind_label"])
             format_text = ", ".join(track["formats"]) or "未知"
-            code_text = f"語系：{track['language_code']}｜格式：{format_text}"
+            self.caption_tree_rows[track_index] = (language_text, kind_text, format_text)
 
-            title_label = ctk.CTkLabel(
-                item_frame,
-                text=title_text,
-                text_color="#075985",
-                font=ctk.CTkFont(size=13, weight="bold"),
-                anchor="w",
-                justify="left",
-                wraplength=330,
-            )
-            title_label.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+            if self.caption_tree is not None:
+                iid = f"caption_{track_index}"
+                self.caption_tree_items[track_index] = iid
+                self.caption_tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=("☑" if var.get() else "☐", language_text, kind_text, format_text),
+                    tags=("odd" if position % 2 else "even",),
+                )
 
-            code_label = ctk.CTkLabel(
-                item_frame,
-                text=code_text,
-                text_color="#64748b",
-                font=ctk.CTkFont(size=12),
-                anchor="w",
-                justify="left",
-                wraplength=330,
-            )
-            code_label.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(2, 10))
+    def on_caption_tree_click(self, event: tk.Event) -> str:
+        """點選字幕列表列時切換勾選狀態。"""
+        if self.caption_tree is None:
+            return ""
+
+        row_id = self.caption_tree.identify_row(event.y)
+        if row_id.startswith("caption_"):
+            self.toggle_caption_tree_row(row_id)
+            return "break"
+        return ""
+
+    def on_caption_tree_space(self, _event: tk.Event) -> str:
+        """鍵盤空白鍵切換目前焦點列。"""
+        if self.caption_tree is None:
+            return ""
+        row_id = self.caption_tree.focus()
+        if row_id.startswith("caption_"):
+            self.toggle_caption_tree_row(row_id)
+            return "break"
+        return ""
+
+    def toggle_caption_tree_row(self, row_id: str) -> None:
+        try:
+            track_index = int(row_id.replace("caption_", "", 1))
+        except ValueError:
+            return
+
+        var = self.caption_check_vars.get(track_index)
+        if var is None:
+            return
+        var.set(not var.get())
+        self.update_caption_tree_row(track_index)
+
+    def update_caption_tree_row(self, track_index: int) -> None:
+        if self.caption_tree is None:
+            return
+        row_id = self.caption_tree_items.get(track_index)
+        row_data = self.caption_tree_rows.get(track_index)
+        var = self.caption_check_vars.get(track_index)
+        if not row_id or not row_data or var is None or not self.caption_tree.exists(row_id):
+            return
+        self.caption_tree.item(row_id, values=("☑" if var.get() else "☐", *row_data))
 
     def set_all_checked(self, checked: bool) -> None:
         """
@@ -1872,6 +2215,28 @@ class SubtitleDownloaderGUI:
         """
         for var in self.caption_check_vars.values():
             var.set(checked)
+        for track_index in self.caption_check_vars:
+            self.update_caption_tree_row(track_index)
+
+    def ensure_ffmpeg_async(self) -> None:
+        """啟動背景檢查；缺少 FFmpeg 時自動下載跨平台套件。"""
+        if resolve_ffmpeg_executable() is not None:
+            return
+        if self.ffmpeg_worker is not None and self.ffmpeg_worker.is_alive():
+            return
+
+        self.status_var.set("系統缺少 FFmpeg，正在背景下載 Windows 版 FFmpeg，請等待。")
+        self.ffmpeg_worker = threading.Thread(target=self.ensure_ffmpeg_worker, daemon=True)
+        self.ffmpeg_worker.start()
+
+    def ensure_ffmpeg_worker(self) -> None:
+        try:
+            ffmpeg_path = ensure_ffmpeg_available(
+                lambda message: self.message_queue.put(("dependency_status", message))
+            )
+            self.message_queue.put(("dependency_ready", str(ffmpeg_path or "")))
+        except Exception as exc:
+            self.message_queue.put(("dependency_error", str(exc)))
 
     def load_captions_async(self) -> None:
         """背景讀取字幕。"""
@@ -1908,7 +2273,7 @@ class SubtitleDownloaderGUI:
         """背景下載選取字幕。"""
         youtube_url = self.url_var.get().strip()
         output_dir = self.output_dir_var.get().strip()
-        target_format = self.format_var.get().strip()
+        target_format = "srt"
 
         selected_indexes = [index for index, var in self.caption_check_vars.items() if var.get()]
 
@@ -1974,10 +2339,6 @@ class SubtitleDownloaderGUI:
             messagebox.showwarning(APP_NAME, "請先貼上 YouTube 影片連結。")
             return
 
-        if media_format == "mp3" and shutil.which("ffmpeg") is None:
-            messagebox.showwarning(APP_NAME, "下載 MP3 需要 ffmpeg，請先安裝 ffmpeg 或改選 mp4。")
-            return
-
         self.media_download_button.configure(state="disabled")
         self.media_progress_var.set(0.0)
         self.media_progress_bar.set(0)
@@ -2020,6 +2381,7 @@ class SubtitleDownloaderGUI:
             self.recognition_window.focus()
             if youtube_url:
                 self.recognition_window.youtube_url = youtube_url
+                self.recognition_window.youtube_url_var.set(youtube_url)
                 self.recognition_window.video_title = video_title
                 self.recognition_window.file_path = None
                 self.recognition_window.source_title_var.set(video_title or youtube_url)
@@ -2032,6 +2394,7 @@ class SubtitleDownloaderGUI:
             youtube_url=youtube_url,
             video_title=video_title,
             service=self.service,
+            output_dir_var=self.output_dir_var,
         )
         self.recognition_window.focus()
 
@@ -2064,6 +2427,12 @@ class SubtitleDownloaderGUI:
                     self.handle_media_success(payload)
                 elif event_type == "media_error":
                     self.handle_media_error(payload)
+                elif event_type == "dependency_status":
+                    self.status_var.set(payload)
+                elif event_type == "dependency_ready":
+                    self.status_var.set(f"FFmpeg 已準備完成，可下載 MP3 與合併高畫質影片。\n{payload}")
+                elif event_type == "dependency_error":
+                    self.status_var.set(f"FFmpeg 自動下載失敗：{payload}")
         except queue.Empty:
             pass
 
@@ -2089,12 +2458,12 @@ class SubtitleDownloaderGUI:
 
         if tracks:
             self.render_caption_list(tracks)
-            self.status_var.set(f"找到 {len(tracks)} 個字幕語系，已進入字幕下載介面。")
+            self.status_var.set(f"找到 {len(tracks)} 個原生 SRT 字幕語系，已進入字幕下載介面。")
             self.download_button.configure(state="normal")
             return
 
-        self.render_empty_caption_message("沒有找到可下載的 CC 或自動字幕，已切換到辨識生成工具。")
-        self.status_var.set("這部影片沒有 CC 字幕，已開啟辨識工具，可下載音訊後產生 SRT。")
+        self.render_empty_caption_message("沒有找到原生 SRT 字幕，已切換到辨識生成工具。")
+        self.status_var.set("這部影片沒有可直接下載的 SRT 字幕，已開啟辨識工具，可下載音訊後產生 SRT。")
         self.download_button.configure(state="disabled")
         self.open_recognition_tool(youtube_url=self.url_var.get().strip(), video_title=str(title))
 
@@ -2125,7 +2494,12 @@ class SubtitleDownloaderGUI:
         self.status_var.set(f"下載完成：\n{file_list}")
         self.download_button.configure(state="normal")
 
-        messagebox.showinfo(APP_NAME, f"字幕下載完成！\n\n{file_list}")
+        should_open = messagebox.askyesno(
+            APP_NAME,
+            f"字幕下載完成！\n\n{file_list}\n\n是否開啟字幕所在資料夾？",
+        )
+        if should_open and downloaded_files:
+            open_folder(Path(downloaded_files[0]).parent)
 
     def handle_download_error(self, message: str) -> None:
         """
